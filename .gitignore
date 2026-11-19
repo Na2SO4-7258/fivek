@@ -1,0 +1,15 @@
+# Only Python source files and Git ignore rules are versioned.
+*
+!*/
+!*.py
+!*.pyi
+!.gitignore
+
+# Dataset, model downloads, generated outputs and Python environments.
+/data/
+/model/
+**/out/
+**/convnext_z/
+**/__pycache__/
+**/.venv/
+**/venv/
