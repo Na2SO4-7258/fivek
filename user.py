@@ -1,16 +1,19 @@
 # ========================= 超参数 =========================
-GROUP_DIR = r"data\semantic"                 # 含 1、2、3... 类别目录的根目录
+# 无需设置分组模式/目录：直接运行时自动跟随 group.py 最近成功运行的分组，每套分组生成一个用户。
+RAW_DIR = "data/raw"                         # 仅 --experts 功能：O.png、A-E 修图及三维 z 缓存
+EXPERT_GROUP_DIR = "data/expert_groups"       # 仅 --experts 功能：输出 A/1..6、B/1..6 ...
+EXPERT_GROUPS = 6                            # 每个专家独立的 z 聚类数量；不同专家同编号不代表同一类
 CHECKPOINT = r"phase1\out\model\best.pt"   # phase1 权重（含 encoder + decoder）
-NUM_USERS = 3                                # 固定生成 user1 ... user3
+NUM_USERS = 1                                # 每套分组固定只生成 user1；模式 3 有 random1..3 三套，故总共三个用户
 SEED = 42
 DEVICE = "auto"                             # auto / cuda / cuda:0 / cpu
 OVERWRITE = 1                            # True：备份旧 user* 和元数据后重新生成
 
 # 复杂修图偏好：每个用户×类别固定一组参数；每张图再加少量扰动
 EXPOSURE_RANGE = (-0.40, 0.40)              # EV
-CONTRAST_RANGE = (0.75, 1.45)
-SATURATION_RANGE = (0.65, 1.50)
-GAMMA_RANGE = (0.82, 1.22)
+CONTRAST_RANGE = (0.7, 1.5)
+SATURATION_RANGE = (0.5, 1.60)
+GAMMA_RANGE = (0.6, 1.4)
 SHADOW_RANGE = (-0.08, 0.20)                # 阴影提亮/压暗
 HIGHLIGHT_RANGE = (0.00, 0.28)              # 高光压缩强度
 CHANNEL_GAIN_RANGE = (0.88, 1.14)           # RGB 通道增益
@@ -21,13 +24,17 @@ DETAIL_RANGE = (0.90, 1.10)                 # 轻微局部对比
 NOISE_SCALE = 0.03                          # 单图扰动占各参数跨度的比例
 # ==========================================================
 
-"""运行：python user.py。依赖 torch、numpy、Pillow。
+"""运行：python group.py，然后 python user.py。依赖 torch、numpy、Pillow。
+分组方式只在 group.py 选择：1 语义→data/semantic，2 色彩→data/color，3 三个随机网络→data/random1..3。
+user.py 自动读取最近成功分组的目录和清单；模式 1/2 在一个目录生成 user1，模式 3 在三个目录各生成一个 user1。
+命令行 --mode/--output 覆盖也会自动同步；只修改 group.py 的 MODE 而未运行，不会混用两套结果。
+保留独立专家分组功能：python user.py --experts，读取/更新原位置专家 z，A-E 各聚六组（需 scikit-learn）。
 
 流程：
 1) 对每个用户×类别采样一组稳定的高维修图偏好；对每张原图应用更复杂的图像编辑，生成目标修图。
 2) 直接使用 phase1 的 encoder 一次前向传播 model.encode(O, T) 得到三维 z。
 3) 使用 phase1 的 decoder 重建并计算 z 拟合 PSNR：decode(O, z) vs T。
-4) 保存 user1..user3/编号.png、user_parameters.json、user_latents.npz。
+4) 保存 user1/编号.png、user_parameters.json、user_latents.npz。
 
 与旧版保持兼容：
 - user_latents.npz 仍保存 users、ids、groups、image_groups、zmean、zstd、z。
@@ -35,17 +42,20 @@ NOISE_SCALE = 0.03                          # 单图扰动占各参数跨度的�
 - user_parameters.json 中记录复杂修图偏好，以及每个用户/类别的拟合 PSNR 汇总。
 """
 
+import argparse
 import hashlib
 import json
 import math
 import re
 import tempfile
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageFilter, ImageOps
 import torch
+import group as grouping
 
 
 ROOT = Path(__file__).resolve().parent
@@ -98,6 +108,34 @@ def collect_images(group_dir):
     return [p.name for p in folders], rows
 
 
+def collect_group(root, metadata, info):
+    """核对一套 group.py 输出的清单、目录和原图副本。"""
+    group_ids, rows = collect_images(root)
+    expected = {}
+    for row in metadata['images']:
+        key = str(row['id']).casefold()
+        if key in expected: raise ValueError(f'分组清单含重复编号：{key}')
+        expected[key] = row
+    if len(rows) != metadata['total'] or {r['id'].casefold() for r in rows} != set(expected):
+        raise ValueError('分组目录的图片与 group.py 清单不一致，请先重新分组')
+    if set(group_ids) != {str(c['id']) for c in metadata['categories']}:
+        raise ValueError('分组目录的类别与 group.py 清单不一致，请先重新分组')
+    for row in rows:
+        entry = expected[row['id'].casefold()]
+        if row['group'] != str(entry['group']) or row['path'].resolve() != (root/entry['file']).resolve():
+            raise ValueError(f"图片 {row['id']} 的类别/路径与分组清单不一致")
+        row['expected_sha256'] = entry.get('source_sha256')
+    # 语义类别允许为空；仅对有图片的类别采样偏好、计算 z 统计，避免空组 NaN。
+    occupied = {r['group'] for r in rows}
+    group_ids = [g for g in group_ids if g in occupied]
+    return root, group_ids, rows, info
+
+
+def collect_current_groups():
+    """模式 1/2 返回一套；模式 3 返回 random1、random2、random3 三套。"""
+    return [collect_group(*item) for item in grouping.current_groups()]
+
+
 def rng_for(*keys):
     payload = json.dumps([SEED, *keys], ensure_ascii=False).encode("utf-8")
     return np.random.default_rng(int.from_bytes(hashlib.sha256(payload).digest()[:8], "little"))
@@ -108,12 +146,12 @@ def sample_scalar(rng, lo_hi):
     return float(rng.uniform(lo, hi))
 
 
-def sample_preferences(group_ids):
+def sample_preferences(group_ids, dataset_key):
     users = []
     for user in range(NUM_USERS):
         prefs = {}
         for gid in group_ids:
-            rng = rng_for("preferences", user + 1, gid)
+            rng = rng_for("preferences", dataset_key, user + 1, gid)
             prefs[gid] = {
                 "exposure": sample_scalar(rng, EXPOSURE_RANGE),
                 "contrast": sample_scalar(rng, CONTRAST_RANGE),
@@ -131,8 +169,8 @@ def sample_preferences(group_ids):
     return users
 
 
-def perturb_preferences(base, image_id, user_idx, gid):
-    rng = rng_for("image-pref", user_idx + 1, gid, image_id)
+def perturb_preferences(base, image_id, user_idx, gid, dataset_key):
+    rng = rng_for("image-pref", dataset_key, user_idx + 1, gid, image_id)
 
     def jitter(key, span):
         return float(base[key] + rng.normal(0.0, NOISE_SCALE * span))
@@ -295,16 +333,18 @@ def compute_group_stats(group_ids, rows, latents):
     return means, stds
 
 
-def generate():
-    if NUM_USERS != 3:
-        raise ValueError("本版本固定生成 3 个用户，请将 NUM_USERS 保持为 3")
-    root, checkpoint_path = resolve(GROUP_DIR), resolve(CHECKPOINT)
-    group_ids, rows = collect_images(root)
+def generate_one(root, group_ids, rows, grouping_info):
+    if NUM_USERS != 1:
+        raise ValueError("本版本每套分组固定生成 1 个用户，请将 NUM_USERS 保持为 1")
+    checkpoint_path = resolve(CHECKPOINT)
+    print(f"自动跟随 group.py：方式 {grouping_info['mode']}（{grouping_info['name']}），目录 {root}", flush=True)
     old = existing_outputs(root)
     if old and not OVERWRITE:
         raise FileExistsError("已有 user* 或用户参数结果；如需重做，请在顶部设置 OVERWRITE=True")
 
-    preferences = sample_preferences(group_ids)
+    # random1..3 代表三位不同模拟用户；分类编号相同也不会导致偏好或单图扰动相同。
+    dataset_key = f"{grouping_info['mode']}:{grouping_info.get('network_index', root.name)}"
+    preferences = sample_preferences(group_ids, dataset_key)
     model, device, checkpoint_info = load_phase1(checkpoint_path)
     users = [f"user{i + 1}" for i in range(NUM_USERS)]
     print(f"{len(rows)} 张原图，{len(group_ids)} 类，{NUM_USERS} 个用户，device={device}", flush=True)
@@ -320,19 +360,22 @@ def generate():
 
         image_records = []
         for i, row in enumerate(rows):
+            source_digest = sha256(row["path"])
+            if row.get('expected_sha256') and source_digest != row['expected_sha256']:
+                raise ValueError(f"原图副本 {row['path']} 已改变，请先重新运行 group.py")
             source = rgb_image(row["path"])
             source_rel = row["path"].relative_to(root).as_posix()
             image_records.append({
                 "id": row["id"],
                 "group": row["group"],
                 "source": source_rel,
-                "source_sha256": sha256(row["path"]),
+                "source_sha256": source_digest,
                 "size": [source.width, source.height],
             })
 
             target_images = []
             for u, user_name in enumerate(users):
-                params = perturb_preferences(preferences[u][row["group"]], row["id"], u, row["group"])
+                params = perturb_preferences(preferences[u][row["group"]], row["id"], u, row["group"], dataset_key)
                 target = apply_complex_edit(source, params)
                 target.save(stage / user_name / f"{row['id']}.png")
                 target_images.append(target)
@@ -383,6 +426,8 @@ def generate():
         metadata = {
             "seed": SEED,
             "group_dir": str(root),
+            "group_mode": grouping_info["mode"],
+            "grouping": grouping_info,
             "num_users": NUM_USERS,
             "images_per_user": len(rows),
             "checkpoint": str(checkpoint_path),
@@ -419,6 +464,8 @@ def generate():
         for name in users:
             if len(list((stage / name).glob("*.png"))) != len(rows):
                 raise RuntimeError(f"{name} 图片数不完整，未提交生成结果")
+        if sha256(Path(grouping_info['manifest'])) != grouping_info['manifest_sha256']:
+            raise RuntimeError('生成期间分组清单改变，未发布用户结果，请重新运行 user.py')
         backup = publish(stage, root, old)
 
     print(f"完成：{root} 下 {', '.join(users)}，每个用户 {len(rows)} 张图片。")
@@ -429,5 +476,114 @@ def generate():
         print(f"{name} 平均 z 拟合 PSNR: {fit_psnr[u].mean():.4f} dB")
 
 
+def generate():
+    datasets = collect_current_groups()
+    print(f"自动跟随 group.py：共 {len(datasets)} 套分组；每套生成 1 个用户。", flush=True)
+    for root, group_ids, rows, grouping_info in datasets:
+        print(f"开始：方式 {grouping_info['mode']}（{grouping_info['name']}），目录 {root}", flush=True)
+        generate_one(root, group_ids, rows, grouping_info)
+
+
+def ensure_expert_groups(raw_dir=None, group_dir=None, experts="ABCDE", force=False):
+    """每个专家单独对原始三维 z 做 KMeans，输出该专家的 1..6 原图文件夹。"""
+    from sklearn.cluster import KMeans
+    from threadpoolctl import threadpool_limits
+    raw = resolve(raw_dir or RAW_DIR)
+    output = resolve(group_dir or EXPERT_GROUP_DIR)
+    if output == raw or raw in output.parents or output in raw.parents:
+        raise ValueError("专家分组输出与原始数据目录不能互相包含")
+    if EXPERT_GROUPS < 2: raise ValueError("EXPERT_GROUPS 至少为 2")
+    metadata = json.loads((raw / "user_parameters.json").read_text(encoding="utf-8"))
+    cache_hash = sha256(raw / "user_latents.npz")
+    if metadata.get("latent_sha256") != cache_hash:
+        raise ValueError("专家 z 缓存与元数据不一致，请重新生成 z")
+    with np.load(raw / "user_latents.npz", allow_pickle=False) as data:
+        users, ids = data["users"].astype(str).tolist(), data["ids"].astype(str).tolist()
+        z = data["z"].copy()
+        valid = data["valid"].copy() if "valid" in data else np.isfinite(z).all(2)
+    if ids != [str(row["id"]) for row in metadata["images"]]: raise ValueError("专家 z 图片编号不一致")
+    if z.shape != (len(users), len(ids), 3) or valid.shape != z.shape[:2]: raise ValueError("专家 z 形状不正确")
+    output.mkdir(parents=True, exist_ok=True)
+    results = {}
+    for expert in experts:
+        if expert not in "ABCDE" or expert not in users: raise ValueError(f"未知专家：{expert}")
+        u = users.index(expert)
+        indices = [i for i, row in enumerate(metadata["images"])
+                   if valid[u, i] and np.isfinite(z[u, i]).all() and (raw / row["source"]).is_file()
+                   and expert in row.get("targets", {}) and (raw / row["targets"][expert]).is_file()]
+        values = z[u, indices].astype(np.float64)
+        if len(values) < EXPERT_GROUPS or len(np.unique(values, axis=0)) < EXPERT_GROUPS:
+            raise ValueError(f"专家 {expert} 的不同有效 z 不足 {EXPERT_GROUPS} 个")
+        config = dict(method="per-expert KMeans on raw 3D z", n_groups=EXPERT_GROUPS, seed=SEED, n_init=20,
+                      latent_sha256=cache_hash, checkpoint_sha256=metadata["checkpoint_sha256"])
+        destination = output / expert
+        manifest_path = destination / "group_expert.json"
+        if destination.is_symlink(): raise ValueError(f"分组目录不能为符号链接：{destination}")
+        if manifest_path.is_file() and not force:
+            previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if (previous.get("expert") == expert and previous.get("config") == config
+                    and [r["id"] for r in previous["images"]] == [ids[i] for i in indices]
+                    and all((destination / r["file"]).is_file() for r in previous["images"])):
+                print(f"复用专家 {expert} 的 {EXPERT_GROUPS} 个 z 分组", flush=True)
+                results[expert] = manifest_path
+                continue
+        if destination.exists() and (not destination.is_dir() or not manifest_path.is_file()):
+            raise ValueError(f"输出已存在且不是本程序的专家分组：{destination}")
+        with threadpool_limits(limits=1):
+            clustering = KMeans(n_clusters=EXPERT_GROUPS, n_init=20, random_state=SEED).fit(values)
+        centers = clustering.cluster_centers_
+        # 以中心的 z1/z2/z3 顺序固定类别编号；不同专家的编号不代表相同语义。
+        order = np.lexsort((centers[:, 2], centers[:, 1], centers[:, 0]))
+        mapping = np.empty(EXPERT_GROUPS, np.int64); mapping[order] = np.arange(1, EXPERT_GROUPS + 1)
+        labels = mapping[clustering.labels_]
+        rows = [dict(id=ids[i], group=str(int(label)), source=str(raw / metadata["images"][i]["source"]),
+                     target=str(raw / metadata["images"][i]["targets"][expert]), file=f"{label}/{ids[i]}.png")
+                for i, label in zip(indices, labels)]
+        categories = []
+        for group in range(1, EXPERT_GROUPS + 1):
+            subset = values[labels == group]
+            categories.append(dict(id=str(group), count=len(subset), zmean=subset.mean(0).tolist(), zstd=subset.std(0).tolist()))
+        manifest = dict(expert=expert, config=config, total=len(rows), categories=categories, images=rows,
+                        created_at_utc=datetime.now(timezone.utc).isoformat(),
+                        note="使用该专家全部有效 z 独立聚类；类别表示编辑空间簇，不是语义类别。训练基线的组均值另外仅用训练集计算。")
+        # 旧分组只临时移入本次 staging；提交成功后自动清理，失败则恢复。
+        with tempfile.TemporaryDirectory(prefix=f".expert-{expert}-", dir=output) as temporary:
+            stage = Path(temporary) / "new"; stage.mkdir()
+            for group in range(1, EXPERT_GROUPS + 1): (stage / str(group)).mkdir()
+            for row in rows: shutil.copy2(row["source"], stage / row["file"])
+            (stage / "group_expert.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            if sha256(raw / "user_latents.npz") != cache_hash: raise RuntimeError("聚类期间 z 缓存改变，请重新运行")
+            backup = Path(temporary) / "old"
+            if destination.exists(): destination.rename(backup)
+            try: stage.rename(destination)
+            except OSError:
+                if backup.exists() and not destination.exists(): backup.rename(destination)
+                raise
+        results[expert] = manifest_path
+        print(f"专家 {expert}：{len(rows)} 张，分组数量 {[c['count'] for c in categories]}；{destination}", flush=True)
+    return results
+
+
+def generate_expert_groups():
+    # 使用 train.py 的同一套专家 z 缓存生成/校验逻辑，避免维护第二套 z。
+    import train as training
+    original_raw, original_checkpoint = training.RAW_DIR, training.PHASE1_CHECKPOINT
+    training.RAW_DIR, training.PHASE1_CHECKPOINT = str(resolve(RAW_DIR)), str(resolve(CHECKPOINT))
+    try:
+        model, device, _ = load_phase1(resolve(CHECKPOINT))
+        training.ensure_expert_cache(model, device)
+    finally:
+        training.RAW_DIR, training.PHASE1_CHECKPOINT = original_raw, original_checkpoint
+    ensure_expert_groups()
+
+
+def main():
+    parser = argparse.ArgumentParser(description='自动跟随 group.py 最近成功输出，生成三个模拟用户')
+    parser.add_argument('--experts', action='store_true', help='单独给 A-E 各自的 z 聚六组，不生成模拟用户')
+    args = parser.parse_args()
+    if args.experts: generate_expert_groups()
+    else: generate()
+
+
 if __name__ == "__main__":
-    generate()
+    main()
